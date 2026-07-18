@@ -1,13 +1,22 @@
 import os
+import threading
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
 
 from config import CATEGORIES, PRODUCTS, KEYS_POOL
-from database import save_purchase
+from database import save_purchase, get_user_purchases
 
 router = Router()
+
+# Для быстрого поиска категории по id товара
+_product_to_cat = {}
+for ck, prods in PRODUCTS.items():
+    for p in prods:
+        _product_to_cat[p["id"]] = ck
+
+_keys_lock = threading.Lock()
 
 
 def main_keyboard():
@@ -25,6 +34,18 @@ async def cmd_start(message: Message):
         "Нажмите «Каталог», чтобы посмотреть товары.",
         reply_markup=main_keyboard(),
     )
+
+
+@router.message(Command("my_purchases"))
+async def cmd_my_purchases(message: Message):
+    purchases = get_user_purchases(message.from_user.id)
+    if not purchases:
+        await message.answer("У вас пока нет покупок.")
+        return
+    lines = ["<b>📦 Ваши покупки:</b>\n"]
+    for p in purchases:
+        lines.append(f"• {p['product_name']} — {p['price']} руб. ({p['purchased_at']})")
+    await message.answer("\n".join(lines))
 
 
 @router.message(F.text == "🛍 Каталог")
@@ -63,23 +84,26 @@ async def show_products(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("prod_"))
 async def show_product_card(callback: CallbackQuery):
     product_id = int(callback.data.replace("prod_", ""))
-    for cat_products in PRODUCTS.values():
-        for p in cat_products:
-            if p["id"] == product_id:
-                text = (
-                    f"<b>{p['name']}</b>\n\n"
-                    f"{p['description']}\n\n"
-                    f"💰 Цена: {p['price']} руб."
-                )
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="💳 Купить", callback_data=f"buy_{p['id']}")],
-                        [InlineKeyboardButton(text="⬅ Назад", callback_data=f"cat_{[k for k, v in PRODUCTS.items() if p in v][0]}")],
-                    ]
-                )
-                await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-                await callback.answer()
-                return
+    cat_key = _product_to_cat.get(product_id)
+    if cat_key is None:
+        await callback.answer("Товар не найден.")
+        return
+    for p in PRODUCTS[cat_key]:
+        if p["id"] == product_id:
+            text = (
+                f"<b>{p['name']}</b>\n\n"
+                f"{p['description']}\n\n"
+                f"💰 Цена: {p['price']} руб."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Купить", callback_data=f"buy_{p['id']}")],
+                    [InlineKeyboardButton(text="⬅ Назад", callback_data=f"cat_{cat_key}")],
+                ]
+            )
+            await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+            await callback.answer()
+            return
     await callback.answer("Товар не найден.")
 
 
@@ -98,35 +122,35 @@ async def back_to_catalog(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("buy_"))
 async def buy_product(callback: CallbackQuery):
     product_id = int(callback.data.replace("buy_", ""))
+    cat_key = _product_to_cat.get(product_id)
+    if cat_key is None:
+        await callback.answer("Товар не найден.")
+        return
     product = None
-    cat_key = None
-    for ck, cat_products in PRODUCTS.items():
-        for p in cat_products:
-            if p["id"] == product_id:
-                product = p
-                cat_key = ck
-                break
-        if product:
+    for p in PRODUCTS[cat_key]:
+        if p["id"] == product_id:
+            product = p
             break
     if not product:
         await callback.answer("Товар не найден.")
         return
 
-    keys = KEYS_POOL.get(product_id, [])
-    if not keys and cat_key != "guides":
-        await callback.answer("К сожалению, товар закончился.", show_alert=True)
-        return
-
-    content = None
-    if cat_key == "guides":
-        file_path = os.path.join("media", f"guide_{product_id}.pdf")
-        if not os.path.exists(file_path):
-            await callback.answer("Файл временно недоступен.", show_alert=True)
+    with _keys_lock:
+        keys = KEYS_POOL.get(product_id, [])
+        if not keys and cat_key != "guides":
+            await callback.answer("К сожалению, товар закончился.", show_alert=True)
             return
-        content = file_path
-    else:
-        content = keys.pop(0)
-        KEYS_POOL[product_id] = keys
+
+        content = None
+        if cat_key == "guides":
+            file_path = os.path.join("media", f"guide_{product_id}.pdf")
+            if not os.path.exists(file_path):
+                await callback.answer("Файл временно недоступен.", show_alert=True)
+                return
+            content = file_path
+        else:
+            content = keys.pop(0)
+            KEYS_POOL[product_id] = keys
 
     save_purchase(
         user_id=callback.from_user.id,

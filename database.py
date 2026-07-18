@@ -36,3 +36,13 @@ def save_purchase(user_id: int, username: str | None, product_id: int, product_n
     )
     conn.commit()
     conn.close()
+
+
+def get_user_purchases(user_id: int) -> list:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT product_name, price, purchased_at FROM purchases WHERE user_id = ? ORDER BY purchased_at DESC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
